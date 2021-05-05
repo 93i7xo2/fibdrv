@@ -23,6 +23,8 @@ static dev_t fib_dev = 0;
 static struct cdev *fib_cdev;
 static struct class *fib_class;
 static DEFINE_MUTEX(fib_mutex);
+static ktime_t kt;
+static long long fibnum;
 
 static long long fib_sequence(long long k)
 {
@@ -60,7 +62,10 @@ static ssize_t fib_read(struct file *file,
                         size_t size,
                         loff_t *offset)
 {
-    return (ssize_t) fib_sequence(*offset);
+    kt = ktime_get();
+    fibnum = fib_sequence(*offset);
+    kt = ktime_sub(ktime_get(), kt);
+    return (ssize_t) fibnum;
 }
 
 /* write operation is skipped */
@@ -103,6 +108,60 @@ const struct file_operations fib_fops = {
     .release = fib_release,
     .llseek = fib_device_lseek,
 };
+
+/*
+ * The "fib" file where a output of "fib_sequence()" is read from.
+ */
+static ssize_t f_show(struct kobject *kobj, struct kobj_attribute *attr,
+			char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE, "%lld\n", fibnum);
+}
+
+static ssize_t f_store(struct kobject *kobj, struct kobj_attribute *attr,
+			 const char *buf, size_t count)
+{
+	int ret, input;
+	ret = kstrtoint(buf, 10, &input);
+	if (ret < 0)
+		return ret;
+    fibnum = fib_sequence(input);
+	return count;
+}
+
+static struct kobj_attribute fib_attribute =
+	__ATTR(fib, 0664, f_show, f_store);
+
+/*
+ * The "time" file where total number of CPU-nanoseconds used by 
+ * "fib_sequence()" is read from.
+ */
+static ssize_t k_show(struct kobject *kobj, struct kobj_attribute *attr,
+			char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE, "%lld\n", ktime_to_ns(kt));
+}
+
+static ssize_t k_store(struct kobject *kobj, struct kobj_attribute *attr,
+			 const char *buf, size_t count)
+{
+	return count;
+}
+
+static struct kobj_attribute ktime_attribute =
+	__ATTR(time, 0444, k_show, k_store);
+
+static struct attribute *attrs[] = {
+	&ktime_attribute.attr,
+    &fib_attribute.attr,
+	NULL,
+};
+
+static struct attribute_group attr_group = {
+	.attrs = attrs,
+};
+
+static struct kobject *fib_kobj;
 
 static int __init init_fib_dev(void)
 {
@@ -149,7 +208,20 @@ static int __init init_fib_dev(void)
         rc = -4;
         goto failed_device_create;
     }
+
+	fib_kobj = kobject_create_and_add("fibdrv", kernel_kobj);
+	if (!fib_kobj){
+        rc = -ENOMEM;
+        goto failed_device_create;
+    }
+
+    rc = sysfs_create_group(fib_kobj, &attr_group);
+	if (rc)
+        goto failed_file_create;
+
     return rc;
+failed_file_create:
+    kobject_put(fib_kobj);
 failed_device_create:
     class_destroy(fib_class);
 failed_class_create:
@@ -161,6 +233,7 @@ failed_cdev:
 
 static void __exit exit_fib_dev(void)
 {
+    kobject_put(fib_kobj);
     mutex_destroy(&fib_mutex);
     device_destroy(fib_class, fib_dev);
     class_destroy(fib_class);

@@ -9,6 +9,14 @@ PWD := $(shell pwd)
 
 GIT_HOOKS := .git/hooks/applied
 
+CPUID := $(shell nproc --all --ignore 1)
+ORIG_ASLR := $(shell cat /proc/sys/kernel/randomize_va_space)
+ORIG_GOV := $(shell cat /sys/devices/system/cpu/cpu$(CPUID)/cpufreq/scaling_governor)
+TURBO_EXISTS := $(shell [ -e /sys/devices/system/cpu/intel_pstate/no_turbo ] && echo 1 || echo 0 )
+ifeq ($(TURBO_EXISTS), 1)
+	ORIG_TURBO := $(shell cat /sys/devices/system/cpu/intel_pstate/no_turbo)
+endif
+
 all: $(GIT_HOOKS) client
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
@@ -39,3 +47,26 @@ check: all
 	$(MAKE) unload
 	@diff -u out scripts/expected.txt && $(call pass)
 	@scripts/verify.py
+
+test: all
+	$(MAKE) unload
+	$(MAKE) load
+	sudo bash -c "echo 0 > /proc/sys/kernel/randomize_va_space"
+	sudo bash -c "echo performance > /sys/devices/system/cpu/cpu$(CPUID)/cpufreq/scaling_governor"
+ifeq ($(TURBO_EXISTS), 1)
+ifeq ($(ORIG_TURBO), 0)
+	sudo bash -c "echo 1 > /sys/devices/system/cpu/intel_pstate/no_turbo"
+endif
+endif
+	@python3 scripts/driver.py
+	sudo bash -c "echo $(ORIG_ASLR) > /proc/sys/kernel/randomize_va_space"
+	sudo bash -c "echo $(ORIG_GOV) > /sys/devices/system/cpu/cpu$(CPUID)/cpufreq/scaling_governor"
+ifeq ($(TURBO_EXISTS), 1)
+ifeq ($(ORIG_TURBO), 0)
+	sudo bash -c "echo $(ORIG_TURBO) > /sys/devices/system/cpu/intel_pstate/no_turbo"
+endif
+endif
+	$(MAKE) unload
+
+sync:
+	rsync -avzh --delete -e "ssh -p32111" $(PWD) meow@192.168.2.50:.
