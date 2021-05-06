@@ -10,6 +10,7 @@ PWD := $(shell pwd)
 GIT_HOOKS := .git/hooks/applied
 
 CPUID := $(shell nproc --all --ignore 1)
+ISOLATED_CPU := $(shell cat /sys/devices/system/cpu/isolated)
 ORIG_ASLR := $(shell cat /proc/sys/kernel/randomize_va_space)
 ORIG_GOV := $(shell cat /sys/devices/system/cpu/cpu$(CPUID)/cpufreq/scaling_governor)
 INTEL_BOOST_EXISTS := $(shell [ -e /sys/devices/system/cpu/intel_pstate/no_turbo ] && echo 1 || echo 0 )
@@ -52,6 +53,16 @@ check: all
 	@scripts/verify.py
 
 test: all
+	$(MAKE) unload
+	$(MAKE) load
+	@python3 scripts/driver.py
+	$(MAKE) unload
+
+test2: all
+ifneq ($(CPUID), $(ISOLATED_CPU))
+	@echo "Isolated core must be the last of all cores."
+	@exit 1
+endif
 	$(MAKE) unload
 	$(MAKE) load
 	sudo bash -c "echo 0 > /proc/sys/kernel/randomize_va_space"
