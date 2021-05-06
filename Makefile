@@ -12,9 +12,12 @@ GIT_HOOKS := .git/hooks/applied
 CPUID := $(shell nproc --all --ignore 1)
 ORIG_ASLR := $(shell cat /proc/sys/kernel/randomize_va_space)
 ORIG_GOV := $(shell cat /sys/devices/system/cpu/cpu$(CPUID)/cpufreq/scaling_governor)
-TURBO_EXISTS := $(shell [ -e /sys/devices/system/cpu/intel_pstate/no_turbo ] && echo 1 || echo 0 )
-ifeq ($(TURBO_EXISTS), 1)
+INTEL_BOOST_EXISTS := $(shell [ -e /sys/devices/system/cpu/intel_pstate/no_turbo ] && echo 1 || echo 0 )
+BOOST_EXISTS := $(shell [ -e /sys/devices/system/cpu/cpufreq/boost ] && echo 1 || echo 0 )
+ifeq ($(INTEL_BOOST_EXISTS), 1)
 	ORIG_TURBO := $(shell cat /sys/devices/system/cpu/intel_pstate/no_turbo)
+else ifeq ($(BOOST_EXISTS), 1)
+	ORIG_TURBO := $(shell cat /sys/devices/system/cpu/cpufreq/boost)
 endif
 
 all: $(GIT_HOOKS) client
@@ -53,18 +56,18 @@ test: all
 	$(MAKE) load
 	sudo bash -c "echo 0 > /proc/sys/kernel/randomize_va_space"
 	sudo bash -c "echo performance > /sys/devices/system/cpu/cpu$(CPUID)/cpufreq/scaling_governor"
-ifeq ($(TURBO_EXISTS), 1)
-ifeq ($(ORIG_TURBO), 0)
+ifeq ($(INTEL_BOOST_EXISTS), 1)
 	sudo bash -c "echo 1 > /sys/devices/system/cpu/intel_pstate/no_turbo"
-endif
+else ifeq ($(BOOST_EXISTS), 1)
+	sudo bash -c "echo 0 > /sys/devices/system/cpu/cpufreq/boost"
 endif
 	@python3 scripts/driver.py
 	sudo bash -c "echo $(ORIG_ASLR) > /proc/sys/kernel/randomize_va_space"
 	sudo bash -c "echo $(ORIG_GOV) > /sys/devices/system/cpu/cpu$(CPUID)/cpufreq/scaling_governor"
-ifeq ($(TURBO_EXISTS), 1)
-ifeq ($(ORIG_TURBO), 0)
+ifeq ($(INTEL_BOOST_EXISTS), 1)
 	sudo bash -c "echo $(ORIG_TURBO) > /sys/devices/system/cpu/intel_pstate/no_turbo"
-endif
+else ifeq ($(BOOST_EXISTS), 1)
+	sudo bash -c "echo $(ORIG_TURBO) > /sys/devices/system/cpu/cpufreq/boost"
 endif
 	$(MAKE) unload
 
