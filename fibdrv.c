@@ -1,3 +1,4 @@
+#include <asm/errno.h>
 #include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/fs.h>
@@ -19,14 +20,22 @@ MODULE_VERSION("0.1");
  */
 #define MAX_LENGTH 92
 
+#define __swap(x, y) \
+    do {             \
+        x = x ^ y;   \
+        y = x ^ y;   \
+        x = x ^ y;   \
+    } while (0)
+
 static dev_t fib_dev = 0;
 static struct cdev *fib_cdev;
 static struct class *fib_class;
 static DEFINE_MUTEX(fib_mutex);
 static ktime_t kt;
 static long long fibnum;
+static long long (*fib_sequence)(long long);
 
-static long long fib_sequence(long long k)
+static long long fib_sequence_original(long long k)
 {
     /* FIXME: use clz/ctz and fast algorithms to speed up */
     long long f[k + 2];
@@ -39,6 +48,27 @@ static long long fib_sequence(long long k)
     }
 
     return f[k];
+}
+
+static long long fib_sequence_fast_doubling(long long k)
+{
+    if (unlikely(k <= 2)) {
+        return k ? 1LL : 0LL;
+    }
+
+    long long f0 = 0, f1 = 1;
+
+    for (uint64_t n = ((uint64_t) 1) << (62 - __builtin_clzll(k)); n; n >>= 1) {
+        long long tmp = f1 * f1 + f0 * f0;
+        f1 = f1 * ((f0 << 1) + f1);
+        f0 = tmp;
+        if (k & n) {
+            __swap(f0, f1);
+            f1 += f0;
+        }
+    }
+
+    return f1;
 }
 
 static int fib_open(struct inode *inode, struct file *file)
@@ -63,7 +93,7 @@ static ssize_t fib_read(struct file *file,
                         loff_t *offset)
 {
     kt = ktime_get();
-    fibnum = fib_sequence(*offset);
+    fibnum = (*fib_sequence)(*offset);
     kt = ktime_sub(ktime_get(), kt);
     return (ssize_t) fibnum;
 }
@@ -112,53 +142,98 @@ const struct file_operations fib_fops = {
 /*
  * The "fib" file where a output of "fib_sequence()" is read from.
  */
-static ssize_t f_show(struct kobject *kobj, struct kobj_attribute *attr,
-			char *buf)
+static ssize_t f_show(struct kobject *kobj,
+                      struct kobj_attribute *attr,
+                      char *buf)
 {
-	return scnprintf(buf, PAGE_SIZE, "%lld\n", fibnum);
+    return scnprintf(buf, PAGE_SIZE, "%lld\n", fibnum);
 }
 
-static ssize_t f_store(struct kobject *kobj, struct kobj_attribute *attr,
-			 const char *buf, size_t count)
+static ssize_t f_store(struct kobject *kobj,
+                       struct kobj_attribute *attr,
+                       const char *buf,
+                       size_t count)
 {
-	int ret, input;
-	ret = kstrtoint(buf, 10, &input);
-	if (ret < 0)
-		return ret;
-    fibnum = fib_sequence(input);
-	return count;
+    int ret, input;
+    ret = kstrtoint(buf, 10, &input);
+    if (ret < 0)
+        return ret;
+    fibnum = (*fib_sequence)(input);
+    return count;
 }
 
-static struct kobj_attribute fib_attribute =
-	__ATTR(fib, 0664, f_show, f_store);
+static struct kobj_attribute fib_attribute = __ATTR(fib, 0664, f_show, f_store);
 
 /*
- * The "time" file where total number of CPU-nanoseconds used by 
+ * The "time" file where total number of CPU-nanoseconds used by
  * "fib_sequence()" is read from.
  */
-static ssize_t k_show(struct kobject *kobj, struct kobj_attribute *attr,
-			char *buf)
+static ssize_t k_show(struct kobject *kobj,
+                      struct kobj_attribute *attr,
+                      char *buf)
 {
-	return scnprintf(buf, PAGE_SIZE, "%lld\n", ktime_to_ns(kt));
+    return scnprintf(buf, PAGE_SIZE, "%lld\n", ktime_to_ns(kt));
 }
 
-static ssize_t k_store(struct kobject *kobj, struct kobj_attribute *attr,
-			 const char *buf, size_t count)
+static ssize_t k_store(struct kobject *kobj,
+                       struct kobj_attribute *attr,
+                       const char *buf,
+                       size_t count)
 {
-	return count;
+    return count;
 }
 
 static struct kobj_attribute ktime_attribute =
-	__ATTR(time, 0444, k_show, k_store);
+    __ATTR(time, 0444, k_show, k_store);
+
+/*
+ * The "mode" file enable users to select the algorithm.
+ */
+static ssize_t m_show(struct kobject *kobj,
+                      struct kobj_attribute *attr,
+                      char *buf)
+{
+    char *str;
+    if (fib_sequence == &fib_sequence_original) {
+        str = "original";
+    } else if (fib_sequence == &fib_sequence_fast_doubling) {
+        str = "fast doubling";
+    }
+    return scnprintf(buf, PAGE_SIZE, "%s\n", str);
+}
+
+static ssize_t m_store(struct kobject *kobj,
+                       struct kobj_attribute *attr,
+                       const char *buf,
+                       size_t count)
+{
+    int ret, input;
+    ret = kstrtoint(buf, 10, &input);
+    if (ret < 0)
+        return ret;
+    switch (input) {
+    case 0:
+        fib_sequence = &fib_sequence_original;
+        break;
+    case 1:
+        fib_sequence = &fib_sequence_fast_doubling;
+        break;
+    }
+    return count;
+}
+
+static struct kobj_attribute kmode_attribute =
+    __ATTR(mode, 0664, m_show, m_store);
 
 static struct attribute *attrs[] = {
-	&ktime_attribute.attr,
+    &ktime_attribute.attr,
+    &kmode_attribute.attr,
     &fib_attribute.attr,
-	NULL,
+    NULL,
 };
 
 static struct attribute_group attr_group = {
-	.attrs = attrs,
+    .attrs = attrs,
 };
 
 static struct kobject *fib_kobj;
@@ -209,15 +284,17 @@ static int __init init_fib_dev(void)
         goto failed_device_create;
     }
 
-	fib_kobj = kobject_create_and_add("fibdrv", kernel_kobj);
-	if (!fib_kobj){
+    fib_kobj = kobject_create_and_add("fibdrv", kernel_kobj);
+    if (!fib_kobj) {
         rc = -ENOMEM;
         goto failed_device_create;
     }
 
     rc = sysfs_create_group(fib_kobj, &attr_group);
-	if (rc)
+    if (rc)
         goto failed_file_create;
+
+    fib_sequence = &fib_sequence_original;
 
     return rc;
 failed_file_create:

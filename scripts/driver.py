@@ -6,6 +6,11 @@ from scipy import stats
 import os
 from tqdm import tqdm
 
+runs = 100
+offset = 100
+col = list(range(0, offset))
+idx = list(range(0, runs))
+
 def filter(df):
     # df (DataFrame):
     #      ---- offset -----
@@ -26,21 +31,20 @@ def filter(df):
     return ret
 
 
-if __name__ == "__main__":
+def test(mode):
     target_cpu = os.cpu_count()-1
     # time_df:
     #      ---- offset -----
     # run |     [data]
-    runs = 1000
-    offset = 100
-    col = list(range(0, offset))
-    idx = list(range(0, runs))
     ktime_df = pd.DataFrame(np.zeros((runs, offset)),
                             index=idx,
                             columns=col)
     utime_df = pd.DataFrame(np.zeros((runs, offset)),
                             index=idx,
                             columns=col)
+
+    subprocess.run(
+            f'sudo /bin/sh -c "echo {mode} > /sys/kernel/fibdrv/mode"', shell=True)
 
     for i in tqdm(range(runs)):
         ret = subprocess.run(
@@ -58,6 +62,17 @@ if __name__ == "__main__":
         'kernel': filter(ktime_df),
         'kernel to user': filter(utime_df - ktime_df),
     }, index=col)
-    result.plot(xlabel='n-th fibonacci', ylabel='time (ns)', title='runtime')
-    plt.legend(loc='lower right')
+    return result
+
+if __name__ == "__main__":
+    original = test(0)
+    fast_doubling = test(1)
+
+    result = pd.DataFrame({
+        'original': original['user'],
+        'fast doubling': fast_doubling['user'],
+    }, index=col)
+
+    ax = result.plot(xlabel='n-th fibonacci', ylabel='time (ns)', title='runtime')
+    plt.legend(loc='upper right')
     plt.savefig("runtime.png")
