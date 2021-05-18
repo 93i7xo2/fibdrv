@@ -7,6 +7,8 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/uaccess.h>
+#include "bn.h"
 
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_AUTHOR("National Cheng Kung University, Taiwan");
@@ -18,7 +20,7 @@ MODULE_VERSION("0.1");
 /* MAX_LENGTH is set to 92 because
  * ssize_t can't fit the number > 92
  */
-#define MAX_LENGTH 92
+#define MAX_LENGTH (~(1 << 31))
 
 #define __swap(x, y) \
     do {             \
@@ -32,44 +34,55 @@ static struct cdev *fib_cdev;
 static struct class *fib_class;
 static DEFINE_MUTEX(fib_mutex);
 static ktime_t kt;
-static long long fibnum;
-static long long (*fib_sequence)(long long);
+static bn *fibnum;
 
-static long long fib_sequence_original(long long k)
+static bn *fib_sequence(uint64_t n)
 {
     /* FIXME: use clz/ctz and fast algorithms to speed up */
-    long long f[k + 2];
-
-    f[0] = 0;
-    f[1] = 1;
-
-    for (int i = 2; i <= k; i++) {
-        f[i] = f[i - 1] + f[i - 2];
+    if (unlikely(n <= 2)) {
+        if (n == 0)
+            return bn_new_from_digit(0);
+        return bn_new_from_digit(1);
     }
 
-    return f[k];
-}
+    bn *a0 = bn_new_from_digit(0); /*  a0 = 0 */
+    bn *a1 = bn_new_from_digit(1); /*  a1 = 1 */
+    bn *const2 = bn_new_from_digit(2);
 
-static long long fib_sequence_fast_doubling(long long k)
-{
-    if (unlikely(k <= 2)) {
-        return k ? 1LL : 0LL;
-    }
-
-    long long f0 = 0, f1 = 1;
-
-    for (uint64_t n = ((uint64_t) 1) << (62 - __builtin_clzll(k)); n; n >>= 1) {
-        long long tmp = f1 * f1 + f0 * f0;
-        f1 = f1 * ((f0 << 1) + f1);
-        f0 = tmp;
+    /* Start at second-highest bit set. */
+    for (uint64_t k = ((uint64_t) 1) << (62 - __builtin_clzll(n)); k; k >>= 1) {
+        /* Both ways use two squares, two adds, one multipy and one shift. */
+        bn *t1, *t2, *t3, *tmp1, *tmp2;
+        tmp1 = bn_mul(a0, const2);
+        t1 = bn_add(tmp1, a1);
+        Bn_DECREF(tmp1);
+        t2 = bn_mul(a0, a0);
+        t3 = bn_mul(a1, a1);
+        tmp1 = a0, tmp2 = a1;
+        a1 = bn_mul(a1, t1);
+        a0 = bn_add(t2, t3);
+        Bn_DECREF(t1);
+        Bn_DECREF(t2);
+        Bn_DECREF(t3);
+        Bn_DECREF(tmp1);
+        Bn_DECREF(tmp2);
         if (k & n) {
-            __swap(f0, f1);
-            f1 += f0;
+            /*  a1 <-> a0 */
+            tmp1 = a1;
+            a1 = a0;
+            a0 = tmp1;
+            /*  a1 += a0 */
+            tmp1 = a1;
+            a1 = bn_add(a0, a1);
+            Bn_DECREF(tmp1);
         }
     }
-
-    return f1;
+    /* Now a1 (alias of output parameter fib) = F[n] */
+    Bn_DECREF(a0);
+    Bn_DECREF(const2);
+    return a1;
 }
+
 
 static int fib_open(struct inode *inode, struct file *file)
 {
@@ -92,10 +105,22 @@ static ssize_t fib_read(struct file *file,
                         size_t size,
                         loff_t *offset)
 {
+    unsigned long remains;
+    bn *dec;
+    char *str;
+    size_t len;
+
     kt = ktime_get();
-    fibnum = (*fib_sequence)(*offset);
+    fibnum = fib_sequence(*offset);
     kt = ktime_sub(ktime_get(), kt);
-    return (ssize_t) fibnum;
+
+    dec = bn_to_dec(fibnum);
+    str = bn_to_str(dec);
+    remains = copy_to_user(buf, str, len = strlen(str) + 1);
+    bfree(str);
+    Bn_DECREF(dec);
+
+    return (ssize_t) remains ? -EFAULT : len - 1;
 }
 
 /* write operation is skipped */
@@ -146,7 +171,19 @@ static ssize_t f_show(struct kobject *kobj,
                       struct kobj_attribute *attr,
                       char *buf)
 {
-    return scnprintf(buf, PAGE_SIZE, "%lld\n", fibnum);
+    bn *dec;
+    char *str;
+    int count = 0;
+
+    if (!fibnum)
+        return count;
+
+    dec = bn_to_dec(fibnum);
+    str = bn_to_str(dec);
+    count = scnprintf(buf, PAGE_SIZE, "%s\n", str);
+    bfree(str);
+    Bn_DECREF(dec);
+    return count;
 }
 
 static ssize_t f_store(struct kobject *kobj,
@@ -158,7 +195,9 @@ static ssize_t f_store(struct kobject *kobj,
     ret = kstrtoint(buf, 10, &input);
     if (ret < 0)
         return ret;
-    fibnum = (*fib_sequence)(input);
+    if (fibnum)
+        Bn_DECREF(fibnum);
+    fibnum = fib_sequence(input);
     return count;
 }
 
@@ -186,48 +225,9 @@ static ssize_t k_store(struct kobject *kobj,
 static struct kobj_attribute ktime_attribute =
     __ATTR(time, 0444, k_show, k_store);
 
-/*
- * The "mode" file enable users to select the algorithm.
- */
-static ssize_t m_show(struct kobject *kobj,
-                      struct kobj_attribute *attr,
-                      char *buf)
-{
-    char *str;
-    if (fib_sequence == &fib_sequence_original) {
-        str = "original";
-    } else if (fib_sequence == &fib_sequence_fast_doubling) {
-        str = "fast doubling";
-    }
-    return scnprintf(buf, PAGE_SIZE, "%s\n", str);
-}
-
-static ssize_t m_store(struct kobject *kobj,
-                       struct kobj_attribute *attr,
-                       const char *buf,
-                       size_t count)
-{
-    int ret, input;
-    ret = kstrtoint(buf, 10, &input);
-    if (ret < 0)
-        return ret;
-    switch (input) {
-    case 0:
-        fib_sequence = &fib_sequence_original;
-        break;
-    case 1:
-        fib_sequence = &fib_sequence_fast_doubling;
-        break;
-    }
-    return count;
-}
-
-static struct kobj_attribute kmode_attribute =
-    __ATTR(mode, 0664, m_show, m_store);
 
 static struct attribute *attrs[] = {
     &ktime_attribute.attr,
-    &kmode_attribute.attr,
     &fib_attribute.attr,
     NULL,
 };
@@ -286,15 +286,17 @@ static int __init init_fib_dev(void)
 
     fib_kobj = kobject_create_and_add("fibdrv", kernel_kobj);
     if (!fib_kobj) {
+        printk(KERN_ALERT "Failed to create kobject");
         rc = -ENOMEM;
         goto failed_device_create;
     }
 
     rc = sysfs_create_group(fib_kobj, &attr_group);
-    if (rc)
+    if (rc) {
+        printk(KERN_ALERT "Failed to create group");
         goto failed_file_create;
+    }
 
-    fib_sequence = &fib_sequence_original;
 
     return rc;
 failed_file_create:
@@ -310,6 +312,8 @@ failed_cdev:
 
 static void __exit exit_fib_dev(void)
 {
+    if (fibnum)
+        Bn_DECREF(fibnum);
     kobject_put(fib_kobj);
     mutex_destroy(&fib_mutex);
     device_destroy(fib_class, fib_dev);

@@ -2,6 +2,7 @@ CONFIG_MODULE_SIG = n
 TARGET_MODULE := fibdrv
 
 obj-m := $(TARGET_MODULE).o
+$(TARGET_MODULE)-objs := fibdrv_mod.o bn.o
 ccflags-y := -std=gnu99 -Wno-declaration-after-statement
 
 KDIR := /lib/modules/$(shell uname -r)/build
@@ -81,6 +82,3 @@ else ifeq ($(BOOST_EXISTS), 1)
 	sudo bash -c "echo $(ORIG_TURBO) > /sys/devices/system/cpu/cpufreq/boost"
 endif
 	$(MAKE) unload
-
-sync:
-	rsync -avzh --delete -e "ssh -p32111" $(PWD) meow@192.168.2.50:.
